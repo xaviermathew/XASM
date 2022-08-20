@@ -64,26 +64,35 @@ class Register(Latch):
     pass
 
 
-class BuiltinRegisters(object):
-    components = ['pc', 'mar', 'mdr', 'cir', 'op1', 'op2', 'ax', 'zero']
-
+class ProgramCounter(Register):
     def __init__(self):
-        self.pc = Register()
-        self.pc.write(0)
-        self.mar = Register()
-        self.mdr = Register()
-        self.cir = Register()
-        self.ax = Register()
-        self.op1 = Register()
-        self.op2 = Register()
-        self.zero = Register()
+        self.write(0)
 
     def reset(self):
-        for reg in self.register_names:
-            if reg == 'pc':
-                self.pc.write(0)
-            else:
-                getattr(self, reg).reset()
+        self.write(0)
+
+class BuiltinRegisters(object):
+    components = [
+        'pc', 'mar', 'mdr', 'ax', 'zero', 'sp', 'retp',
+        'cir', 'op1', 'op2',
+    ]
+
+    def __init__(self):
+        self.pc = ProgramCounter()
+        self.mar = Register()
+        self.mdr = Register()
+        self.ax = Register()
+        self.zero = Register()
+        self.sp = Register()
+        self.retp = Register()
+
+        self.cir = Register()
+        self.op1 = Register()
+        self.op2 = Register()
+
+    def reset(self):
+        for reg in self.components:
+            getattr(self, reg).reset()
 
     def __repr__(self):
         return '<%s\n%s\n>' % (self.__class__.__name__, '\n'.join('%s:%s' % (reg, getattr(self, reg)) for reg in self.components))
@@ -92,14 +101,17 @@ class BuiltinRegisters(object):
 class GeneralPurposeRegisters(object):
     def __init__(self, num_registers):
         self.num_registers = num_registers
-        self.registers = [Register() for _ in range(num_registers)]
+        for i in range(num_registers):
+            setattr(self, 'r%s' % i, Register())
 
     def reset(self):
-        for r in self.registers:
+        for i in range(self.num_registers):
+            r = getattr(self, 'r%s' % i)
             r.reset()
 
     def __repr__(self):
-        return '<%s\n%s\n>' % (self.__class__.__name__, '\n'.join('R%s:%s' % (i, repr(reg)) for i, reg in enumerate(self.registers)))
+        reg_repr = '\n'.join('r%s:%s' % (i, repr(getattr(self, 'r%s' % i))) for i in range(self.num_registers))
+        return '<%s\n%s\n>' % (self.__class__.__name__, reg_repr)
 
 
 class Step(object):
@@ -215,9 +227,7 @@ class MoveValueToRegister(Step):
 
         value = bi_registers.op1.read()
         register_num = bi_registers.op2.read()
-        if register_num.startswith('R'):
-            register_num = int(register_num[1:])
-        cpu.gp_registers.registers[register_num].write(value)
+        getattr(cpu.gp_registers, register_num).write(value)
 
         cpu.control_bus.write_next_state(ControlBus.IDLE)
 
@@ -233,8 +243,15 @@ class MoveRegisterToRegister(Step):
 
         src = bi_registers.op1.read()
         dest = bi_registers.op2.read()
-        value = gp_registers.registers[src].read()
-        gp_registers.registers[dest].write(value)
+        if src.startswith('r'):
+            value = getattr(gp_registers, src).read()
+        else:
+            value = getattr(bi_registers, src).read()
+
+        if dest.startswith('r'):
+            getattr(gp_registers, dest).write(value)
+        else:
+            getattr(bi_registers, dest).write(value)
 
         cpu.control_bus.write_next_state(ControlBus.IDLE)
 
@@ -251,7 +268,7 @@ class MovePointerToRegister(Step):
         src = None
         dest = bi_registers.op2.read()
         value = None
-        cpu.gp_registers.registers[dest].write(value)
+        getattr(cpu.gp_registers, dest).write(value)
 
         cpu.control_bus.write_next_state(ControlBus.IDLE)
 
@@ -269,13 +286,11 @@ class OperatorBase(Step):
         gp_registers = cpu.gp_registers
 
         lhs = bi_registers.op1.read()
-        if lhs.startswith('R'):
-            lhs = int(lhs[1:])
         rhs = bi_registers.op2.read()
-        if rhs.startswith('R'):
-            rhs = int(rhs[1:])
-        value = self.operator(gp_registers.registers[lhs].read(), gp_registers.registers[rhs].read())
+        lhs_reg = getattr(gp_registers, lhs)
+        rhs_reg = getattr(gp_registers, rhs)
 
+        value = self.operator(lhs_reg.read(), rhs_reg.read())
         dest = getattr(bi_registers, self.destination)
         dest.write(value)
 
@@ -338,6 +353,49 @@ class GreaterThanOrEquals(LogicBase):
     operator = operator.ge
 
 
+class Jump(Step):
+    def __init__(self, executor):
+        self.executor = executor
+
+    def tick(self):
+        cpu = self.executor.cpu
+        bi_registers = cpu.builtin_registers
+        gp_registers = cpu.gp_registers
+
+        address = bi_registers.op1.read()
+        bi_registers.pc.write(address)
+
+        cpu.control_bus.write_next_state(ControlBus.IDLE)
+
+
+class JumpEquals(Step):
+    def __init__(self, executor):
+        self.executor = executor
+
+    def tick(self):
+        cpu = self.executor.cpu
+        bi_registers = cpu.builtin_registers
+
+        check = bi_registers.zero.read()
+        if check:
+            address = bi_registers.op1.read()
+            bi_registers.pc.write(address)
+
+        cpu.control_bus.write_next_state(ControlBus.IDLE)
+
+
+class Not(Step):
+    pass
+
+
+class Call(Step):
+    pass
+
+
+class Return(Step):
+    pass
+
+
 class Executor(object):
     MOV_VAL = 'MOV_VAL'
     MOV_REG = 'MOV_REG'
@@ -356,10 +414,11 @@ class Executor(object):
     GTE = 'GTE'
 
     JMP = 'JMP'
-    JT = 'JT'
+    JEQ = 'JEQ'
     NOT = 'NOT'
-    PUSH = 'PUSH'
-    POP = 'POP'
+
+    CALL = 'CALL'
+    RET = 'RET'
 
     instruction_set = {
         MOV_VAL: (2, MoveValueToRegister),
@@ -378,11 +437,12 @@ class Executor(object):
         LTE: (2, LessThanOrEquals),
         GTE: (2, GreaterThanOrEquals),
 
-        JMP: (1, Or),
-        JT: (1, Or),
-        NOT: (1, Or),
-        PUSH: (1, Or),
-        POP: (1, Or),
+        JMP: (1, Jump),
+        JEQ: (1, JumpEquals),
+        NOT: (1, Not),
+        CALL: (1, Call),
+
+        RET: (0, Return),
     }
 
     def __init__(self, cpu):
@@ -496,16 +556,18 @@ class CPU(object):
         return '<%s\n%s\n>' % (self.__class__.__name__, '\n'.join('%s' % c for c in components))
 
 
-x = CPU(num_bytes=10, num_registers=2, ticks_per_second=100)
 rom = [
 int(t) if t.isdigit() else t
 for line in
 """
-MOV_VAL 10 R0
-MOV_VAL 20 R1
-ADD R0 R1
+MOV_VAL 10 r0
+MOV_VAL 20 r1
+ADD r0 r1
+MOV_REG ax r1
+JMP 6 0
 """.splitlines()
 for t in line.split() if t]
+x = CPU(num_bytes=len(rom) + 20, num_registers=2, ticks_per_second=100)
 for i, word in enumerate(rom):
     x.ram.memory[i] = word
 x.clock.start()
